@@ -150,11 +150,20 @@ class Model:
         self.timer.it_start = time.time()
         # train iteration
         self.optim.zero_grad()
+        if self.graph.nerf.use_occ_grid:
+            self.graph.nerf.occ_grid.every_n_step(
+                step=self.it,
+                occ_eval_fn=lambda x: self.graph.nerf.occ_eval_fn(
+                    opt, x, mode="train"
+                ),
+            )
         var = self.graph.forward(opt, var, mode="train")
         loss = self.graph.compute_loss(opt, var, mode="train")
         loss = self.summarize_loss(opt, var, loss)
-        loss.all.backward()
-        self.optim.step()
+        #  print(self.graph.nerf.occ_grid.binary.float().mean())
+        if loss.all.requires_grad:
+            loss.all.backward()
+            self.optim.step()
         # after train iteration
         if (self.it + 1) % opt.freq.scalar == 0:
             self.log_scalars(opt, var, loss, step=self.it + 1, split="train")
@@ -201,6 +210,7 @@ class Model:
             loss_val[key] /= len(self.test_data)
         self.log_scalars(opt, var, loss_val, step=ep, split="val")
         log.loss_val(opt, loss_val.all)
+        self.graph.train()
 
     @torch.no_grad()
     def log_scalars(self, opt, var, loss, metric=None, step=0, split="train"):

@@ -4,6 +4,7 @@ import time
 
 import camera
 import lpips
+import nerfacc
 import numpy as np
 import torch
 import torch.nn.functional as torch_F
@@ -346,30 +347,95 @@ class Graph(base.Graph):
     def render(self, opt, pose, intr=None, ray_idx=None, mode=None):
         batch_size = len(pose)
         center, ray = camera.get_center_and_ray(
-            opt, pose, intr=intr
+            opt, pose, intr=intr, ray_idx=ray_idx
         )  # [B,HW,3]
         while (
             ray.isnan().any()
         ):  # TODO: weird bug, ray becomes NaN arbitrarily if batch_size>1, not deterministic reproducible
             center, ray = camera.get_center_and_ray(
-                opt, pose, intr=intr
+                opt, pose, intr=intr, ray_idx=ray_idx
             )  # [B,HW,3]
-        if ray_idx is not None:
-            # consider only subset of rays
-            center, ray = center[:, ray_idx], ray[:, ray_idx]
+        #  if ray_idx is not None:
+        #      # consider only subset of rays
+        #      center, ray = center[:, ray_idx], ray[:, ray_idx]
         if opt.camera.ndc:
             # convert center/ray representations to NDC
             center, ray = camera.convert_NDC(opt, center, ray, intr=intr)
         # render with main MLP
-        depth_samples = self.sample_depth(
-            opt, batch_size, num_rays=ray.shape[1]
-        )  # [B,HW,N,1]
-        rgb_samples, density_samples = self.nerf.forward_samples(
-            opt, center, ray, depth_samples, mode=mode
-        )
-        rgb, depth, opacity, prob = self.nerf.composite(
-            opt, ray, rgb_samples, density_samples, depth_samples
-        )
+        rgb = depth = opacity = None
+        if self.nerf.use_occ_grid:
+            assert not opt.nerf.fine_sampling
+            flatten_center = center.reshape(-1, 3)
+            flatten_ray = torch_F.normalize(ray.reshape(-1, 3), dim=-1)
+
+            def sigma_fn(t_starts, t_ends, ray_indices):
+                if ray_indices.shape[0] == 0:
+                    return torch.zeros((0, 1), device=ray_indices.device)
+                t_origins = flatten_center[ray_indices]
+                t_dirs = flatten_ray[ray_indices]
+                positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
+                return self.nerf(
+                    opt, positions, t_dirs, mode=mode, density_only=True
+                )[:, None]
+
+            def rgb_sigma_fn(t_starts, t_ends, ray_indices):
+                if ray_indices.shape[0] == 0:
+                    return torch.zeros(
+                        (0, 3), device=ray_indices.device
+                    ), torch.zeros((0, 1), device=ray_indices.device)
+                t_origins = flatten_center[ray_indices]
+                t_dirs = flatten_ray[ray_indices]
+                positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
+                rgb, sigma = self.nerf(opt, positions, t_dirs, mode=mode)
+                return rgb, sigma[:, None]
+
+            ray_indices, t_starts, t_ends = nerfacc.ray_marching(
+                flatten_center,
+                flatten_ray,
+                scene_aabb=self.nerf.occ_grid.roi_aabb,  # type: ignore
+                grid=self.nerf.occ_grid,
+                sigma_fn=sigma_fn,
+                near_plane=opt.nerf.depth.range[0],
+                far_plane=opt.nerf.depth.range[1],
+                render_step_size=self.nerf.occ_step_size,
+                stratified=mode == "train",
+                alpha_thre=self.nerf.occ_alpha_thres,
+            )
+            #  # DEBUG
+            #  if mode != "val":
+            #      occ_perc = self.nerf.occ_grid.binary.float().mean().item()
+            #      samples_per_ray = (
+            #          torch.unique(ray_indices, return_counts=True)[1]
+            #          .float()
+            #          .mean()
+            #          .item()
+            #      )
+            #      print(
+            #          f"occ_perc = {occ_perc}, num_samples = {samples_per_ray}"
+            #      )
+            rgb, opacity, depth = nerfacc.rendering(
+                t_starts,
+                t_ends,
+                ray_indices,
+                n_rays=flatten_center.shape[0],
+                rgb_sigma_fn=rgb_sigma_fn,
+                render_bkgd=opt.data.bgcolor,
+            )
+            rgb, opacity, depth = [
+                t.reshape(batch_size, -1, t.shape[-1])
+                for t in [rgb, opacity, depth]
+            ]
+        else:
+            depth_samples = self.sample_depth(
+                opt, batch_size, num_rays=ray.shape[1]
+            )  # [B,HW,N,1]
+            # NOTE(Hang Gao @ 02/25): center -> rays_o, ray -> rays_d.
+            rgb_samples, density_samples = self.nerf.forward_samples(
+                opt, center, ray, depth_samples, mode=mode
+            )
+            rgb, depth, opacity, prob = self.nerf.composite(
+                opt, ray, rgb_samples, density_samples, depth_samples
+            )
         ret = edict(rgb=rgb, depth=depth, opacity=opacity)  # [B,HW,K]
         # render with fine MLP from coarse MLP
         if opt.nerf.fine_sampling:
@@ -484,6 +550,26 @@ class Graph(base.Graph):
 class NeRF(torch.nn.Module):
     def __init__(self, opt):
         super().__init__()
+
+        self.occ_grid_reso = opt.nerf.get("occ_grid_reso", -1)
+        self.use_occ_grid = self.occ_grid_reso > 0
+        self.occ_grid = None
+        self.occ_aabb = opt.nerf.get(
+            "occ_aabb", [-1.5, -1.5, -1.5, 1.5, 1.5, 1.5]
+        )
+        self.occ_step_size = opt.nerf.get("occ_step_size", 5e-3)
+        self.occ_alpha_thres = opt.nerf.get("occ_alpha_thres", 0.0)
+        if self.use_occ_grid > 0:
+            self.occ_grid = nerfacc.OccupancyGrid(
+                roi_aabb=self.occ_aabb, resolution=self.occ_grid_reso
+            )
+
+            def occ_eval_fn(opt, x, mode):
+                density = self(opt, x, mode=mode, density_only=True)
+                return density * self.occ_step_size
+
+            self.occ_eval_fn = occ_eval_fn
+
         self.define_network(opt)
 
     def define_network(self, opt):
@@ -534,7 +620,9 @@ class NeRF(torch.nn.Module):
             torch.nn.init.xavier_uniform_(linear.weight, gain=relu_gain)
         torch.nn.init.zeros_(linear.bias)
 
-    def forward(self, opt, points_3D, ray_unit=None, mode=None):  # [B,...,3]
+    def forward(
+        self, opt, points_3D, ray_unit=None, mode=None, density_only=False
+    ):  # [B,...,3]
         if opt.arch.posenc:
             points_enc = self.positional_encoding(
                 opt, points_3D, L=opt.arch.posenc.L_3D
@@ -562,6 +650,8 @@ class NeRF(torch.nn.Module):
                 density = density_activ(density)
                 feat = feat[..., 1:]
             feat = torch_F.relu(feat)
+        if density_only:
+            return density
         # predict RGB values
         if opt.nerf.view_dep:
             assert ray_unit is not None

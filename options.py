@@ -92,11 +92,17 @@ def override_options(opt, opt_over, key_stack=None, safe_check=False):
                 add_new = None
                 while add_new not in ["y", "n"]:
                     key_str = ".".join(key_stack + [key])
-                    add_new = input(
-                        '"{}" not found in original opt, add? (y/n) '.format(
+                    print(
+                        '"{}" not found in original opt, force yes (y)'.format(
                             key_str
                         )
                     )
+                    add_new = "y"
+                    #  add_new = input(
+                    #      '"{}" not found in original opt, add? (y/n) '.format(
+                    #          key_str
+                    #      )
+                    #  )
                 if add_new == "n":
                     print("safe exiting...")
                     exit()
@@ -152,9 +158,11 @@ def save_options_file(opt):
             )
             os.system("diff {} {}".format(opt_fname, opt_new_fname))
             os.system("rm {}".format(opt_new_fname))
-            override = None
-            while override not in ["y", "n"]:
-                override = input("override? (y/n) ")
+            #  override = None
+            #  while override not in ["y", "n"]:
+            #      override = input("override? (y/n) ")
+            override = "y"
+            print("override (y)")
             if override == "n":
                 print("safe exiting...")
                 exit()
