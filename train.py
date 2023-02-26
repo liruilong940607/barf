@@ -1,10 +1,14 @@
-import numpy as np
-import os,sys,time
-import torch
 import importlib
+import os
+import sys
+import time
+
+import numpy as np
+import torch
 
 import options
 from util import log
+
 
 def main():
 
@@ -28,5 +32,6 @@ def main():
 
         m.train(opt)
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
