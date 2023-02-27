@@ -156,6 +156,8 @@ class Model:
                 occ_eval_fn=lambda x: self.graph.nerf.occ_eval_fn(
                     opt, x, mode="train"
                 ),
+                occ_thre=self.graph.nerf.occ_thres,
+                ema_decay=self.graph.nerf.occ_ema_decay,
             )
         var = self.graph.forward(opt, var, mode="train")
         loss = self.graph.compute_loss(opt, var, mode="train")

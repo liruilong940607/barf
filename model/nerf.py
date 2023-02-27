@@ -559,6 +559,8 @@ class NeRF(torch.nn.Module):
         )
         self.occ_step_size = opt.nerf.get("occ_step_size", 5e-3)
         self.occ_alpha_thres = opt.nerf.get("occ_alpha_thres", 0.0)
+        self.occ_thres = opt.nerf.get("occ_thres", 0.01)
+        self.occ_ema_decay = opt.nerf.get("occ_ema_decay", 0.95)
         if self.use_occ_grid > 0:
             self.occ_grid = nerfacc.OccupancyGrid(
                 roi_aabb=self.occ_aabb, resolution=self.occ_grid_reso
